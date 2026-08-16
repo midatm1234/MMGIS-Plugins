@@ -1,0 +1,77 @@
+name: Agent Unit Tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  agent-unit:
+    name: Agent and AgentChat unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout MMGIS host
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: NASA-AMMOS/MMGIS
+          path: mmgis
+
+      - name: Checkout this plugin container
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          path: mmgis/plugins/NASA-AMMOS--MMGIS-Plugins
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: mmgis/package-lock.json
+
+      - name: Install MMGIS and plugin dependencies
+        run: npm ci
+        working-directory: mmgis
+
+      # npm ci runs the root postinstall resolver. Run the public idempotent
+      # command explicitly as a clean-checkout contract so Agent provider
+      # modules (including Azure) cannot be omitted by workflow drift.
+      - name: Verify aggregated plugin dependencies
+        run: npm run plugins:install
+        working-directory: mmgis
+
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+        working-directory: mmgis
+
+      - name: Setup Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11"
+
+      - name: Install aggregated plugin Python dependencies
+        run: |
+          if [ -f plugin-python-requirements.txt ]; then
+            python -m pip install -r plugin-python-requirements.txt
+          fi
+        working-directory: mmgis
+
+      - name: Run plugin unit tests
+        run: npm run test:plugins:unit -- --project=chromium
+        working-directory: mmgis
+        env:
+          AUTH: "off"
+
+      - name: Run Agent raster integration test serially
+        run: >-
+          npx playwright test
+          plugins/NASA-AMMOS--MMGIS-Plugins/backend/Agent/tests/rasterDifference.spec.js
+          plugins/NASA-AMMOS--MMGIS-Plugins/backend/Agent/tests/rasterStatistics.spec.js
+          --grep @integration --workers=1 --project=chromium
+        working-directory: mmgis
+        env:
+          PLAYWRIGHT_TEST_UNIT_ONLY: "true"
+          MMGIS_RUN_RASTER_INTEGRATION: "true"

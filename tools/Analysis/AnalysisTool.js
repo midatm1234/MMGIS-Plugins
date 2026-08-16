@@ -8,6 +8,11 @@ import Map_ from '@basics/Map_/Map_'
 import Help from '@basics/UserInterface_/components/Help/Help'
 import TimeControl from '@basics/TimeControl_/TimeControl'
 
+import {
+    registerAnalysisCopilotAction,
+    unregisterAnalysisCopilotAction,
+} from './copilotAction'
+
 import './AnalysisTool.css'
 
 const helpKey = 'AnalysisTool'
@@ -286,6 +291,9 @@ let AnalysisTool = {
         selectedPoints: [], // Array of {id, lat, lon, properties, layerId} objects
         markers: [], // Visual markers for selected points
     },
+    copilotActionRegistrationId: null,
+    layersLoadPromise: null,
+    layersLoadError: null,
     initialize: function () {
         //Get tool variables
         const toolVars = L_.getToolVars('analysis') || {}
@@ -300,17 +308,201 @@ let AnalysisTool = {
         if (!this.apiBaseUrl) {
             console.warn('Analysis Tool: API Base URL not configured. Please configure it in the mission settings.')
         }
+        this.registerCopilotAction(true)
     },
     finalize: function () {
-        // Any finalization logic can go here
+        // ToolController finalizes after the mission's layers are ready. Retry
+        // registration here in case mmgisAPI was not published during init.
+        this.registerCopilotAction()
     },
     make: function (t, fromInit) {
         this.MMGISInterface = new interfaceWithMMGIS(fromInit)
+        this.registerCopilotAction()
     },
     destroy: function () {
+        const remainsConfigured = this.isConfiguredForCurrentMission()
         // Clean up all map handlers and drawing state
         this.cleanupMapHandlers()
-        this.MMGISInterface.separateFromMMGIS()
+        this.MMGISInterface?.separateFromMMGIS?.()
+        this.MMGISInterface = null
+        this.layersLoadPromise = null
+        this.layersLoadError = null
+
+        // Drop the handler owned by this panel instance. If Analysis remains a
+        // configured mission tool, immediately publish a fresh closed-panel
+        // capability whose handler can safely reopen the tool on demand.
+        this.unregisterCopilotAction()
+        if (remainsConfigured) this.registerCopilotAction()
+    },
+    isConfiguredForCurrentMission: function () {
+        const tools = L_?.tools
+        if (!Array.isArray(tools)) return true
+        return tools.some((tool) => {
+            const values = [tool?.name, tool?.js, tool?.id]
+                .filter(Boolean)
+                .map((value) => String(value).trim().toLowerCase())
+            return values.some((value) =>
+                ['analysis', 'analysistool', 'official-analysis'].includes(
+                    value
+                )
+            )
+        })
+    },
+    getCopilotAvailability: function () {
+        if (!this.isConfiguredForCurrentMission()) {
+            return {
+                available: false,
+                reason: 'The Analysis tool is not configured for this mission.',
+            }
+        }
+        if (!this.apiBaseUrl) {
+            return {
+                available: false,
+                reason: 'The Analysis service is not configured for this mission.',
+            }
+        }
+        if (typeof window.mmgisAPI?.openTool !== 'function') {
+            return {
+                available: false,
+                reason: 'The MMGIS tool control API is unavailable.',
+            }
+        }
+        return true
+    },
+    registerCopilotAction: function (replaceExisting = false) {
+        const api = window.mmgisAPI
+        if (
+            !this.isConfiguredForCurrentMission() ||
+            typeof api?.registerCopilotAction !== 'function'
+        )
+            return null
+        if (this.copilotActionRegistrationId && !replaceExisting)
+            return this.copilotActionRegistrationId
+
+        if (replaceExisting || this.copilotActionRegistrationId) {
+            try {
+                unregisterAnalysisCopilotAction(api)
+            } catch (error) {
+                console.warn(
+                    'Analysis Tool: stale Copilot action cleanup failed.',
+                    error
+                )
+            }
+            this.copilotActionRegistrationId = null
+        }
+
+        try {
+            this.copilotActionRegistrationId = registerAnalysisCopilotAction(
+                api,
+                (args, context) =>
+                    this.executeCopilotAnalysis(args, context),
+                () => this.getCopilotAvailability()
+            )
+            return this.copilotActionRegistrationId
+        } catch (error) {
+            console.error(
+                'Analysis Tool: Copilot action registration failed.',
+                error
+            )
+            return null
+        }
+    },
+    unregisterCopilotAction: function () {
+        if (!this.copilotActionRegistrationId) return false
+        try {
+            const removed = unregisterAnalysisCopilotAction(window.mmgisAPI)
+            this.copilotActionRegistrationId = null
+            return removed
+        } catch (error) {
+            console.error(
+                'Analysis Tool: Copilot action cleanup failed.',
+                error
+            )
+            return false
+        }
+    },
+    executeCopilotAnalysis: async function (args = {}, context = null) {
+        const failure = (message, code, data = null) => ({
+            ok: false,
+            message,
+            data,
+            error: { code },
+        })
+        const layerName = String(args?.layer_name || '').trim()
+        if (!layerName) {
+            return failure(
+                'Choose a layer before running the Analysis tool.',
+                'ANALYSIS_LAYER_REQUIRED'
+            )
+        }
+
+        const availability = this.getCopilotAvailability()
+        if (availability !== true && availability?.available === false) {
+            return failure(
+                availability.reason || 'The Analysis tool is unavailable.',
+                'ANALYSIS_TOOL_UNAVAILABLE'
+            )
+        }
+
+        let toolResult
+        try {
+            toolResult = await window.mmgisAPI.openTool('Analysis')
+        } catch (error) {
+            console.error('Analysis Tool: could not open for Copilot.', error)
+            return failure(
+                'The Analysis tool could not be opened in this mission.',
+                'ANALYSIS_TOOL_UNAVAILABLE'
+            )
+        }
+        if (toolResult?.open !== true) {
+            return failure(
+                'The Analysis tool could not be opened in this mission.',
+                'ANALYSIS_TOOL_UNAVAILABLE'
+            )
+        }
+
+        if (this.layersLoadPromise) {
+            const ready = await Promise.race([
+                this.layersLoadPromise.then(() => true).catch(() => false),
+                new Promise((resolve) =>
+                    setTimeout(() => resolve(false), 10000)
+                ),
+            ])
+            if (!ready || this.layersLoadError) {
+                return failure(
+                    'The Analysis tool opened, but its layer catalog could not be loaded.',
+                    'ANALYSIS_LAYER_CATALOG_UNAVAILABLE',
+                    { tool: toolResult }
+                )
+            }
+        }
+
+        const result = await this.prepareCopilotAnalysis({
+            layerName,
+            chartType: args?.chart_type || 'timeseries',
+            mode: args?.mode || 'bbox',
+            startTime: args?.start_date || null,
+            endTime: args?.end_date || null,
+        })
+        const errorCode =
+            result?.errorCode ||
+            result?.error?.code ||
+            (result?.ok === true ? null : 'ANALYSIS_EXECUTION_FAILED')
+        return {
+            ok: result?.ok === true,
+            message:
+                result?.message ||
+                'The Analysis tool could not confirm the requested configuration.',
+            data: {
+                ...(result?.data || {}),
+                layer: layerName,
+                chartType: args?.chart_type || 'timeseries',
+                mode: args?.mode || 'bbox',
+                tool: toolResult,
+                mission: context?.mission || L_?.mission || null,
+            },
+            ...(errorCode ? { error: { code: errorCode } } : {}),
+        }
     },
     getUrlString: function () {
         return ''
@@ -322,6 +514,9 @@ let AnalysisTool = {
         $('#analysisEndTime').val(TimeControl.getEndTime())
     },
     setMode: function (mode) {
+        if (!['point', 'bbox', 'line', 'vectorpoints'].includes(mode)) {
+            return false
+        }
         this.currentMode = mode
 
         // Update dropdown value
@@ -356,6 +551,7 @@ let AnalysisTool = {
 
         // Handle map interactions based on mode
         this.setupMapInteraction(mode)
+        return true
     },
     setupMapInteraction: function (mode) {
         // Clean up previous handlers
@@ -1554,19 +1750,82 @@ let AnalysisTool = {
     },
 
     selectLayer: function (layerName) {
-        if (!layerName || !this.availableLayers[layerName]) {
+        const requested = String(layerName || '').trim().toLowerCase()
+        const resolved = Object.keys(this.availableLayers || {}).find((key) => {
+            const info = this.availableLayers[key] || {}
+            return [key, info.name, info.display_name, info.displayName]
+                .filter(Boolean)
+                .some((value) => String(value).trim().toLowerCase() === requested)
+        })
+        if (!resolved) {
             console.warn('Invalid layer name:', layerName)
-            return
+            return false
         }
 
-        this.selectedLayer = layerName
-        const layerInfo = this.availableLayers[layerName]
+        this.selectedLayer = resolved
+        const layerInfo = this.availableLayers[resolved]
 
         // Update layer info display
         this.updateLayerInfoDisplay(layerInfo)
 
         // Update dropdown selection
-        $('#analysisLayerSelect').val(layerName)
+        $('#analysisLayerSelect').val(resolved)
+        this.updateGenerateButtonState()
+        return true
+    },
+
+    prepareCopilotAnalysis: async function ({
+        layerName,
+        chartType = 'timeseries',
+        mode = 'bbox',
+        startTime = null,
+        endTime = null,
+    } = {}) {
+        if (!this.selectLayer(layerName)) {
+            return {
+                ok: false,
+                message: `The Analysis tool does not offer "${String(layerName || '')}" as an analyzable layer.`,
+                errorCode: 'ANALYSIS_LAYER_UNAVAILABLE',
+            }
+        }
+        const supportedCharts = new Set([
+            'timeseries',
+            'histogram',
+            'scatterplot',
+        ])
+        if (!supportedCharts.has(chartType) || !this.setMode(mode)) {
+            return {
+                ok: false,
+                message: 'The requested Analysis tool configuration is unsupported.',
+                errorCode: 'ANALYSIS_CONFIGURATION_UNSUPPORTED',
+            }
+        }
+        $('#analysisChartTypeSelect').val(chartType).trigger('change')
+        if (startTime) $('#analysisStartTime').val(startTime)
+        if (endTime) $('#analysisEndTime').val(endTime)
+        this.updateGenerateButtonState()
+
+        const hasSpatialInput =
+            (mode === 'point' &&
+                String($('#analysisLat').val() || '').trim().length > 0 &&
+                String($('#analysisLng').val() || '').trim().length > 0 &&
+                Number.isFinite(Number($('#analysisLat').val())) &&
+                Number.isFinite(Number($('#analysisLng').val()))) ||
+            (mode === 'bbox' && !!this.bboxDrawing?.projectedBounds) ||
+            (mode === 'line' && this.lineDrawing?.points?.length >= 2) ||
+            (mode === 'vectorpoints' &&
+                this.vectorPointsDrawing?.selectedPoints?.length > 0)
+        if (!hasSpatialInput) {
+            return {
+                ok: false,
+                message:
+                    mode === 'point'
+                        ? 'The Analysis tool is prepared. Select a point on the map, then generate the analysis.'
+                        : 'The Analysis tool is prepared. Draw or select the required map geometry, then generate the analysis.',
+                errorCode: 'ANALYSIS_INPUT_REQUIRED',
+            }
+        }
+        return this.generateAnalysis()
     },
 
     updateLayerInfoDisplay: function (layerInfo) {
@@ -1954,10 +2213,31 @@ let AnalysisTool = {
                     endTime
                 )
             }
+            return {
+                ok: true,
+                message: 'Analysis results were generated in the Analysis panel.',
+                data: {
+                    layer: this.selectedLayer,
+                    mode: this.currentMode,
+                    chartType,
+                },
+            }
         } catch (error) {
             // Clear stats panel if error occurred during histogram generation
             const chartType = $('#analysisChartTypeSelect').val()
             this.showError(error.message, chartType === 'histogram')
+            const inputRequired = /please (set|select|draw)|valid latitude|valid longitude/i.test(
+                String(error?.message || '')
+            )
+            return {
+                ok: false,
+                message: inputRequired
+                    ? String(error.message)
+                    : 'The Analysis tool could not generate results from the current inputs.',
+                errorCode: inputRequired
+                    ? 'ANALYSIS_INPUT_REQUIRED'
+                    : 'ANALYSIS_EXECUTION_FAILED',
+            }
         }
     },
 
@@ -5167,9 +5447,14 @@ function interfaceWithMMGIS(fromInit) {
     })
 
     // Initialize layers
-    AnalysisTool.fetchLayers().catch((error) => {
-        console.error('Failed to initialize layers:', error)
-    })
+    AnalysisTool.layersLoadError = null
+    AnalysisTool.layersLoadPromise = AnalysisTool.fetchLayers().catch(
+        (error) => {
+            AnalysisTool.layersLoadError = error
+            console.error('Failed to initialize layers:', error)
+            return null
+        }
+    )
 
     //Share everything. Don't take things that aren't yours.
     // Put things back where you found them.

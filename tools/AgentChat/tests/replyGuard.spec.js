@@ -8,7 +8,7 @@ import {
 // bubble. This is the client-side last line of defense — the backend
 // (provider.js) is expected to always send a readable reply, but the UI
 // must not go blank even if that guarantee is ever violated.
-test.describe('AgentChat replyGuard', () => {
+test.describe('@unit AgentChat replyGuard', () => {
   test('prefers a non-empty reply over text', () => {
     expect(resolveAssistantReply('Here are your layers.', 'fallback text')).toBe(
       'Here are your layers.',

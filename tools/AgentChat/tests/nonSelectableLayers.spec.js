@@ -7,7 +7,7 @@ import { isNonSelectableLayerName } from '../nonSelectableLayers';
 // config field currently marks non-selectable layers) — narrowly scoped so
 // it doesn't accidentally exclude other reference layers like GIBS Blue
 // Marble, which users *can* select even though it's also time-invariant.
-test.describe('AgentChat nonSelectableLayers', () => {
+test.describe('@unit AgentChat nonSelectableLayers', () => {
   test('flags Land Mask regardless of case/whitespace', () => {
     expect(isNonSelectableLayerName('Land Mask')).toBe(true);
     expect(isNonSelectableLayerName('land mask')).toBe(true);

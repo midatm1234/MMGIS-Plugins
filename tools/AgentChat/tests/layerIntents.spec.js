@@ -9,7 +9,7 @@ import {
 // through the LLM, since "what layers exist" and "which are analyzable" are
 // deterministic lookups against the current mission config. Covers every
 // phrasing called out in the bug report plus the follow-up request.
-test.describe('AgentChat layerIntents: list layers', () => {
+test.describe('@unit AgentChat layerIntents: list layers', () => {
   for (const phrase of [
     'list layers',
     'List layers',
@@ -38,7 +38,7 @@ test.describe('AgentChat layerIntents: list layers', () => {
   }
 });
 
-test.describe('AgentChat layerIntents: analyzable layers', () => {
+test.describe('@unit AgentChat layerIntents: analyzable layers', () => {
   for (const phrase of [
     'which layers can I analyze?',
     'Which layers can I analyze?',
